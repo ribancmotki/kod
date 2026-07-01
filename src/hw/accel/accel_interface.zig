@@ -48,9 +48,6 @@ pub const FutharkContext = struct {
         const cfg = futhark.futhark_context_config_new();
         if (cfg == null) return AccelError.FutharkConfigFailed;
 
-        // These knobs only exist in GPU backends (cuda/opencl/hip). The sequential
-        // C backend used by the inference server and CPU benchmarks does not
-        // define them, so we gate them behind the comptime gpu_enabled flag.
         if (comptime gpu_enabled) {
             futhark.futhark_context_config_set_device(cfg, "");
             futhark.futhark_context_config_set_default_group_size(cfg, 256);
@@ -157,9 +154,7 @@ pub const PinnedMemory = struct {
 
     pub fn asSlice(self: *Self, comptime T: type) ?[]T {
         if (self.ptr == null) return null;
-        if (self.size == 0) return &[_]T{};
         const count = self.size / @sizeOf(T);
-        if (count == 0) return &[_]T{};
         const aligned: [*]T = @ptrCast(@alignCast(self.ptr.?));
         return aligned[0..count];
     }
@@ -490,8 +485,6 @@ pub const FutharkArray1DF32 = struct {
     }
 };
 
-// One RSF layer = (W_s, W_t, s_bias, t_bias) + their SFD momentum buffers.
-// Stored as opaque Futhark GPU handles.
 pub const RSFLayer = struct {
     weights_s: FutharkArray2DF16,
     weights_t: FutharkArray2DF16,
@@ -539,12 +532,7 @@ pub const RSFAccelerator = struct {
         var ctx = try FutharkContext.init();
         errdefer ctx.deinit();
 
-        // All ranks use the SAME deterministic seed so that the model is
-        // consistent across the cluster BEFORE any all-reduce happens.
-        // Per-layer seeds are derived from a base seed and the layer index
-        // to break symmetry across layers (otherwise every layer would
-        // initialize to the same values).
-        const base_seed: u64 = 0x4A41494445204E4F; // "JAIDE NO"
+        const base_seed: u64 = 0x4A41494445204E4F;
         const init_stddev: f32 = 0.02;
 
         var layers = allocator.alloc(RSFLayer, num_layers) catch return AccelError.AllocationFailed;
@@ -634,8 +622,6 @@ pub const RSFAccelerator = struct {
         const clip_min_bits: u16 = @bitCast(self.clip_min);
         const clip_max_bits: u16 = @bitCast(self.clip_max);
 
-        // Chain through layers: current_arr is the live 2D activation.
-        // We allocate fresh outputs from rsf_forward and free intermediates as we go.
         var current_arr: ?*futhark.struct_futhark_f16_2d = input.arr;
         const rows = input.rows;
         const cols = input.cols;
@@ -667,7 +653,6 @@ pub const RSFAccelerator = struct {
                 return AccelError.NullPointer;
             }
 
-            // Free previous intermediate (but never the caller's input).
             if (li > 0) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, current_arr);
             current_arr = next_arr;
         }
@@ -675,15 +660,6 @@ pub const RSFAccelerator = struct {
         return FutharkArray2DF16{ .arr = current_arr, .rows = rows, .cols = cols };
     }
 
-    // Multi-layer training step.
-    // 1) Forward: run batch_forward through each layer, caching every intermediate
-    //    3D activation tensor on the GPU.
-    // 2) Loss: batch_compute_loss(final_output, target) (accumulator is f32).
-    // 3) Initial gradient: 2*(final_output - target) via compute_initial_grad_l2.
-    // 4) Backward: for each layer from N-1 down to 0, call batch_gradients_full to get
-    //    (grad_ws, grad_wt, grad_sb, grad_tb, grad_input). Apply sfd_update_half /
-    //    sfd_update_bias to the layer's weights, and feed grad_input back as the
-    //    grad_output of the previous layer.
     pub fn trainingStep(
         self: *Self,
         inputs: *FutharkArray3DF16,
@@ -702,40 +678,36 @@ pub const RSFAccelerator = struct {
         const clip_max_bits: u16 = @bitCast(self.clip_max);
 
         const n_layers = self.layers.len;
-        const step_alloc = std.heap.page_allocator;
-        // activations[0] = inputs (caller-owned), activations[1..n_layers] = layer outputs (we own).
-        var activations = step_alloc.alloc(?*futhark.struct_futhark_f16_3d, n_layers + 1) catch return AccelError.AllocationFailed;
-        defer step_alloc.free(activations);
-        var owned = step_alloc.alloc(bool, n_layers + 1) catch return AccelError.AllocationFailed;
-        defer step_alloc.free(owned);
-        for (activations) |*a| a.* = null;
-        for (owned) |*o| o.* = false;
-        activations[0] = inputs.arr;
-        owned[0] = false;
 
-        // free all owned activations on early exit
-        var early_err: ?AccelError = null;
+        var current_act: ?*futhark.struct_futhark_f16_3d = inputs.arr;
+        var current_act_owned: bool = false;
+        var grad_out: ?*futhark.struct_futhark_f16_3d = null;
+
         errdefer {
-            var idx: usize = 0;
-            while (idx < activations.len) : (idx += 1) {
-                if (owned[idx] and activations[idx] != null) {
-                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, activations[idx]);
+            if (grad_out) |g| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
+                grad_out = null;
+            }
+            if (current_act_owned) {
+                if (current_act) |act| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, act);
+                    current_act = null;
                 }
+                current_act_owned = false;
             }
         }
 
-        // ----- Forward pass -----
         var li: usize = 0;
         while (li < n_layers) : (li += 1) {
             const layer = &self.layers[li];
             if (layer.weights_s.arr == null or layer.weights_t.arr == null) return AccelError.NullPointer;
             if (layer.s_bias.arr == null or layer.t_bias.arr == null) return AccelError.NullPointer;
 
-            var next_act: ?*futhark.struct_futhark_f16_3d = null;
+            var rsf_out: ?*futhark.struct_futhark_f16_3d = null;
             const rc = futhark.futhark_entry_batch_forward(
                 self.ctx.ctx,
-                &next_act,
-                activations[li],
+                &rsf_out,
+                current_act,
                 layer.weights_s.arr,
                 layer.weights_t.arr,
                 layer.s_bias.arr,
@@ -743,36 +715,51 @@ pub const RSFAccelerator = struct {
                 clip_min_bits,
                 clip_max_bits,
             );
-            if (rc != 0 or next_act == null) {
+            if (rc != 0 or rsf_out == null) {
                 const err_str = futhark.futhark_context_get_error(self.ctx.ctx);
                 if (err_str) |s| std.debug.print("[Futhark batch_forward L{d} error] {s}\n", .{ li, std.mem.span(s) });
-                early_err = AccelError.FutharkForwardFailed;
-                return early_err.?;
+                if (rsf_out) |out| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, out);
+                }
+                return AccelError.FutharkForwardFailed;
             }
-            // OFTB butterfly mixing after RSF coupling layer
+
+            if (current_act_owned) {
+                if (current_act) |act| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, act);
+                }
+            }
+            current_act = rsf_out;
+            current_act_owned = true;
+
             var oftb_out: ?*futhark.struct_futhark_f16_3d = null;
             const oftb_rc = futhark.futhark_entry_batch_oftb_forward(
                 self.ctx.ctx,
                 &oftb_out,
-                next_act,
+                current_act,
             );
-            if (oftb_rc != 0 or oftb_out == null) {
-                early_err = AccelError.FutharkForwardFailed;
-                return early_err.?;
+            if (current_act) |act| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, act);
             }
-            // Replace next_act with OFTB output
-            _ = futhark.futhark_free_f16_3d(self.ctx.ctx, next_act);
-            next_act = oftb_out;
-            activations[li + 1] = next_act;
-            owned[li + 1] = true;
+            current_act = null;
+            current_act_owned = false;
+            if (oftb_rc != 0 or oftb_out == null) {
+                if (oftb_out) |out| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, out);
+                }
+                return AccelError.FutharkForwardFailed;
+            }
+            current_act = oftb_out;
+            current_act_owned = true;
         }
 
-        // ----- Loss on final output -----
+        if (current_act == null) return AccelError.NullPointer;
+
         var loss_bits: u16 = 0;
         const loss_rc = futhark.futhark_entry_batch_compute_loss(
             self.ctx.ctx,
             &loss_bits,
-            activations[n_layers],
+            current_act,
             targets.arr,
         );
         if (loss_rc != 0) {
@@ -782,12 +769,10 @@ pub const RSFAccelerator = struct {
         }
         const loss_f16: f16 = @bitCast(loss_bits);
 
-        // ----- Initial gradient seed: dL/dY_final = 2*(Y_final - target) -----
-        var grad_out: ?*futhark.struct_futhark_f16_3d = null;
         const gseed_rc = futhark.futhark_entry_compute_initial_grad_l2(
             self.ctx.ctx,
             &grad_out,
-            activations[n_layers],
+            current_act,
             targets.arr,
         );
         if (gseed_rc != 0 or grad_out == null) {
@@ -796,33 +781,39 @@ pub const RSFAccelerator = struct {
             return AccelError.FutharkBackwardFailed;
         }
 
-        // ----- Backward pass (top-down) -----
         var lb: usize = n_layers;
         while (lb > 0) {
             lb -= 1;
             const layer = &self.layers[lb];
 
-            // OFTB backward: transform gradient through butterfly mixing
-            var oftb_grad: ?*futhark.struct_futhark_f16_3d = null;
-            const oftb_bwd_rc = futhark.futhark_entry_batch_oftb_backward(
+            if (current_act == null or grad_out == null) return AccelError.NullPointer;
+            if (layer.weights_s.arr == null or layer.weights_t.arr == null) return AccelError.NullPointer;
+            if (layer.s_bias.arr == null or layer.t_bias.arr == null) return AccelError.NullPointer;
+
+            var rsf_out_reconstructed: ?*futhark.struct_futhark_f16_3d = null;
+            const oftb_inv_rc = futhark.futhark_entry_batch_oftb_backward(
                 self.ctx.ctx,
-                &oftb_grad,
-                grad_out,
+                &rsf_out_reconstructed,
+                current_act,
             );
-            _ = futhark.futhark_free_f16_3d(self.ctx.ctx, grad_out);
-            grad_out = null;
-            if (oftb_bwd_rc != 0 or oftb_grad == null) {
+            if (oftb_inv_rc != 0 or rsf_out_reconstructed == null) {
+                if (rsf_out_reconstructed) |out| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, out);
+                }
                 return AccelError.FutharkBackwardFailed;
             }
-            grad_out = oftb_grad;
 
-            // batch_gradients_full(activations[lb], grad_out, layer weights)
-            var grad_tup: ?*futhark.struct_futhark_opaque_tup5_grad_full = null;
-            const bg_rc = futhark.futhark_entry_batch_gradients_full(
+            if (current_act) |act| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, act);
+            }
+            current_act = null;
+            current_act_owned = false;
+
+            var layer_input_reconstructed: ?*futhark.struct_futhark_f16_3d = null;
+            const rsf_inv_rc = futhark.futhark_entry_batch_rsf_inverse(
                 self.ctx.ctx,
-                &grad_tup,
-                activations[lb],
-                grad_out,
+                &layer_input_reconstructed,
+                rsf_out_reconstructed,
                 layer.weights_s.arr,
                 layer.weights_t.arr,
                 layer.s_bias.arr,
@@ -830,13 +821,63 @@ pub const RSFAccelerator = struct {
                 clip_min_bits,
                 clip_max_bits,
             );
-            // grad_out is consumed by Futhark (its dL/dY for this layer); free our handle.
-            _ = futhark.futhark_free_f16_3d(self.ctx.ctx, grad_out);
+            if (rsf_out_reconstructed) |out| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, out);
+            }
+            rsf_out_reconstructed = null;
+            if (rsf_inv_rc != 0 or layer_input_reconstructed == null) {
+                const err_str = futhark.futhark_context_get_error(self.ctx.ctx);
+                if (err_str) |s| std.debug.print("[Futhark batch_rsf_inverse L{d} error] {s}\n", .{ lb, std.mem.span(s) });
+                if (layer_input_reconstructed) |inp| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, inp);
+                }
+                return AccelError.FutharkBackwardFailed;
+            }
+
+            var oftb_grad: ?*futhark.struct_futhark_f16_3d = null;
+            const oftb_bwd_rc = futhark.futhark_entry_batch_oftb_backward(
+                self.ctx.ctx,
+                &oftb_grad,
+                grad_out,
+            );
+            if (grad_out) |g| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
+            }
             grad_out = null;
+            if (oftb_bwd_rc != 0 or oftb_grad == null) {
+                if (oftb_grad) |g| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
+                }
+                if (layer_input_reconstructed) |inp| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, inp);
+                }
+                return AccelError.FutharkBackwardFailed;
+            }
+
+            var grad_tup: ?*futhark.struct_futhark_opaque_tup5_grad_full = null;
+            const bg_rc = futhark.futhark_entry_batch_gradients_full(
+                self.ctx.ctx,
+                &grad_tup,
+                layer_input_reconstructed,
+                oftb_grad,
+                layer.weights_s.arr,
+                layer.weights_t.arr,
+                layer.s_bias.arr,
+                layer.t_bias.arr,
+                clip_min_bits,
+                clip_max_bits,
+            );
+            if (oftb_grad) |g| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
+            }
+            oftb_grad = null;
 
             if (bg_rc != 0 or grad_tup == null) {
                 const err_str = futhark.futhark_context_get_error(self.ctx.ctx);
                 if (err_str) |s| std.debug.print("[Futhark batch_gradients_full L{d} error] {s}\n", .{ lb, std.mem.span(s) });
+                if (layer_input_reconstructed) |inp| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, inp);
+                }
                 return AccelError.FutharkBackwardFailed;
             }
 
@@ -854,44 +895,79 @@ pub const RSFAccelerator = struct {
             _ = futhark.futhark_free_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16(self.ctx.ctx, grad_tup);
 
             if (proj0 != 0 or proj1 != 0 or proj2 != 0 or proj3 != 0 or proj4 != 0 or
-                grad_ws == null or grad_wt == null or grad_sb == null or grad_tb == null or grad_in == null) {
+                grad_ws == null or grad_wt == null or grad_sb == null or grad_tb == null or grad_in == null)
+            {
                 if (grad_ws != null) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, grad_ws);
                 if (grad_wt != null) _ = futhark.futhark_free_f16_2d(self.ctx.ctx, grad_wt);
                 if (grad_sb != null) _ = futhark.futhark_free_f16_1d(self.ctx.ctx, grad_sb);
                 if (grad_tb != null) _ = futhark.futhark_free_f16_1d(self.ctx.ctx, grad_tb);
                 if (grad_in != null) _ = futhark.futhark_free_f16_3d(self.ctx.ctx, grad_in);
+                if (layer_input_reconstructed) |inp| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, inp);
+                }
                 return AccelError.FutharkBackwardFailed;
             }
 
-            // ----- SFD updates for this layer's W_s, W_t, s_bias, t_bias -----
+            errdefer {
+                if (grad_ws) |g| {
+                    _ = futhark.futhark_free_f16_2d(self.ctx.ctx, g);
+                    grad_ws = null;
+                }
+                if (grad_wt) |g| {
+                    _ = futhark.futhark_free_f16_2d(self.ctx.ctx, g);
+                    grad_wt = null;
+                }
+                if (grad_sb) |g| {
+                    _ = futhark.futhark_free_f16_1d(self.ctx.ctx, g);
+                    grad_sb = null;
+                }
+                if (grad_tb) |g| {
+                    _ = futhark.futhark_free_f16_1d(self.ctx.ctx, g);
+                    grad_tb = null;
+                }
+                if (grad_in) |g| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
+                    grad_in = null;
+                }
+                if (layer_input_reconstructed) |inp| {
+                    _ = futhark.futhark_free_f16_3d(self.ctx.ctx, inp);
+                    layer_input_reconstructed = null;
+                }
+            }
+
             try sfdUpdateMat(self, &layer.weights_s, &layer.velocity_s, grad_ws, lr_bits, momentum_bits);
             try sfdUpdateMat(self, &layer.weights_t, &layer.velocity_t, grad_wt, lr_bits, momentum_bits);
             try sfdUpdateBias(self, &layer.s_bias, &layer.velocity_sb, grad_sb, lr_bits, momentum_bits);
             try sfdUpdateBias(self, &layer.t_bias, &layer.velocity_tb, grad_tb, lr_bits, momentum_bits);
 
             _ = futhark.futhark_free_f16_2d(self.ctx.ctx, grad_ws);
+            grad_ws = null;
             _ = futhark.futhark_free_f16_2d(self.ctx.ctx, grad_wt);
+            grad_wt = null;
             _ = futhark.futhark_free_f16_1d(self.ctx.ctx, grad_sb);
+            grad_sb = null;
             _ = futhark.futhark_free_f16_1d(self.ctx.ctx, grad_tb);
+            grad_tb = null;
 
-            // grad_in becomes dL/dY for the previous (lower) layer.
             grad_out = grad_in;
+            grad_in = null;
+
+            current_act = layer_input_reconstructed;
+            current_act_owned = true;
+            layer_input_reconstructed = null;
         }
 
-        // Discard final grad_in (it is dL/d(model_input), not needed for training).
-        if (grad_out != null) {
-            _ = futhark.futhark_free_f16_3d(self.ctx.ctx, grad_out);
+        if (grad_out) |g| {
+            _ = futhark.futhark_free_f16_3d(self.ctx.ctx, g);
             grad_out = null;
         }
 
-        // Free intermediate activations (everything except the caller's inputs).
-        var fi: usize = 0;
-        while (fi < activations.len) : (fi += 1) {
-            if (owned[fi] and activations[fi] != null) {
-                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, activations[fi]);
-                activations[fi] = null;
-                owned[fi] = false;
+        if (current_act_owned) {
+            if (current_act) |act| {
+                _ = futhark.futhark_free_f16_3d(self.ctx.ctx, act);
+                current_act = null;
             }
+            current_act_owned = false;
         }
 
         return loss_f16;
@@ -1105,11 +1181,6 @@ pub const RSFAccelerator = struct {
         };
     }
 
-    /// Returns the raw GPU device pointer for the requested per-layer tensor.
-    /// Used by the distributed trainer to feed NCCL allReduce directly
-    /// without round-tripping through host memory.
-    /// Element count is the second return value (half*half for matrices,
-    /// half for biases).
     pub fn getLayerDevicePtr(
         self: *Self,
         layer_idx: usize,
@@ -1285,7 +1356,7 @@ pub const EmbeddingAccelerator = struct {
             v.* = @floatCast((rnd.float(f32) - 0.5) * 0.02);
         }
 
-        const weight = try FutharkArray2DF16.newFromFlat(ctx, weight_data, vocab_size, dim);
+        var weight = try FutharkArray2DF16.newFromFlat(ctx, weight_data, vocab_size, dim);
         errdefer weight.free(ctx);
         const grad_weight = try FutharkArray2DF16.newZeros(ctx, vocab_size, dim, std.heap.page_allocator);
 
@@ -1316,8 +1387,8 @@ pub const EmbeddingAccelerator = struct {
             t.* = @intCast(@min(tokens[i], @as(u32, @intCast(self.vocab_size - 1))));
         }
 
-        const tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
-        errdefer tok_arr.free(self.ctx);
+        var tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        defer tok_arr.free(self.ctx);
 
         var out: ?*futhark.struct_futhark_f16_2d = null;
         const rc = futhark.futhark_entry_embedding_forward(
@@ -1326,7 +1397,6 @@ pub const EmbeddingAccelerator = struct {
             tok_arr.arr,
             self.weight.arr,
         );
-        tok_arr.free(self.ctx);
 
         if (rc != 0 or out == null) return AccelError.FutharkForwardFailed;
         return FutharkArray2DF16{ .arr = out, .rows = tokens.len, .cols = self.dim };
@@ -1341,7 +1411,7 @@ pub const EmbeddingAccelerator = struct {
             t.* = @intCast(@min(tokens[i], @as(u32, @intCast(self.vocab_size - 1))));
         }
 
-        const tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
+        var tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
         defer tok_arr.free(self.ctx);
 
         var new_grad: ?*futhark.struct_futhark_f16_2d = null;
@@ -1379,4 +1449,3 @@ pub const EmbeddingAccelerator = struct {
         _ = futhark.futhark_free_f16_2d(self.ctx.ctx, old_g);
     }
 };
-
