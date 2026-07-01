@@ -179,9 +179,6 @@ pub extern "c" fn futhark_entry_training_step(
     in13_clip_max: u16,
 ) c_int;
 
-// === Multi-layer backprop primitives ===
-// `batch_forward` returns the full-sample output tensor [batch][seq][half*2] so it can be cached
-// as activations between layers.
 pub extern "c" fn futhark_entry_batch_forward(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f16_3d,
@@ -194,7 +191,6 @@ pub extern "c" fn futhark_entry_batch_forward(
     in6_clip_max: u16,
 ) c_int;
 
-// `batch_compute_loss` returns the scalar mean-squared-error loss in f16 (accumulated in f32).
 pub extern "c" fn futhark_entry_batch_compute_loss(
     ctx: ?*struct_futhark_context,
     out: ?*u16,
@@ -202,8 +198,6 @@ pub extern "c" fn futhark_entry_batch_compute_loss(
     in1_targets: ?*const struct_futhark_f16_3d,
 ) c_int;
 
-// `compute_initial_grad_l2` returns 2*(output-target) per element, used as the dL/dY seed at the
-// top of the multi-layer stack.
 pub extern "c" fn futhark_entry_compute_initial_grad_l2(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f16_3d,
@@ -211,8 +205,6 @@ pub extern "c" fn futhark_entry_compute_initial_grad_l2(
     in1_targets: ?*const struct_futhark_f16_3d,
 ) c_int;
 
-// `batch_gradients_full` returns (grad_ws, grad_wt, grad_sb, grad_tb, grad_input) as an opaque tup5.
-// grad_input is [batch][seq][half*2] -- the dL/dX of the current layer, fed as dL/dY of the previous one.
 pub extern "c" fn futhark_entry_batch_gradients_full(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_opaque_tup5_grad_full,
@@ -261,7 +253,6 @@ pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1
     obj: ?*const struct_futhark_opaque_tup5_grad_full,
 ) c_int;
 
-// SFD updates per-layer (already exist as entry points in main.fut, declared here for completeness).
 pub extern "c" fn futhark_entry_sfd_update_half(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_opaque_tup2_2d,
@@ -307,6 +298,18 @@ pub extern "c" fn futhark_entry_batch_oftb_backward(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f16_3d,
     grad_outputs: ?*const struct_futhark_f16_3d,
+) c_int;
+
+pub extern "c" fn futhark_entry_batch_rsf_inverse(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_3d,
+    in0_outputs: ?*const struct_futhark_f16_3d,
+    in1_weights_s: ?*const struct_futhark_f16_2d,
+    in2_weights_t: ?*const struct_futhark_f16_2d,
+    in3_s_bias: ?*const struct_futhark_f16_1d,
+    in4_t_bias: ?*const struct_futhark_f16_1d,
+    in5_clip_min: u16,
+    in6_clip_max: u16,
 ) c_int;
 
 pub extern "c" fn futhark_entry_embedding_forward(
@@ -365,4 +368,3 @@ pub extern "c" fn futhark_project_opaque_tup2_arr1d_f16_arr1d_f16_1(
     out: ?*?*struct_futhark_f16_1d,
     obj: ?*const struct_futhark_opaque_tup2_1d,
 ) c_int;
-
