@@ -263,6 +263,36 @@ entry batch_oftb_forward [batch_size][seq_len][dim] (inputs: [batch_size][seq_le
 entry batch_oftb_backward [batch_size][seq_len][dim] (grad_outputs: [batch_size][seq_len][dim]f16) : *[batch_size][seq_len][dim]f16 =
   oftb_backward grad_outputs
 
+let rsf_inverse [n][half] (output: [n][half*2]f16)
+  (weights_s: [half][half]f16) (weights_t: [half][half]f16)
+  (s_bias: [half]f16) (t_bias: [half]f16)
+  (clip_min: f16) (clip_max: f16) : *[n][half*2]f16 =
+  let d = half * 2
+  in map (\row ->
+    let y1 = row[0:half] :> [half]f16
+    let y2 = row[half:d] :> [half]f16
+    let trans = map2 (\j bias ->
+      bias f16.+ f16.sum (map2 (\w x -> w f16.* x) weights_t[j] y1)
+    ) (iota half) t_bias
+    let x2 = map2 (\a b -> a f16.- b) y2 trans
+    let pre_scale = map2 (\j bias ->
+      bias f16.+ f16.sum (map2 (\w x -> w f16.* x) weights_s[j] x2)
+    ) (iota half) s_bias
+    let scale = map (\ps ->
+      let clipped = f16.max clip_min (f16.min clip_max ps)
+      in f16.exp clipped
+    ) pre_scale
+    let x1 = map2 (\y s -> y f16./ s) y1 scale
+    in x1 ++ x2 :> [half*2]f16
+  ) output
+
+entry batch_rsf_inverse [batch_size][seq_len][half]
+  (outputs: [batch_size][seq_len][half*2]f16)
+  (weights_s: [half][half]f16) (weights_t: [half][half]f16)
+  (s_bias: [half]f16) (t_bias: [half]f16)
+  (clip_min: f16) (clip_max: f16) : *[batch_size][seq_len][half*2]f16 =
+  map (\sample -> rsf_inverse sample weights_s weights_t s_bias t_bias clip_min clip_max) outputs
+
 entry embedding_forward [n][vocab_size][dim] (tokens: [n]i64) (weight: [vocab_size][dim]f16) : *[n][dim]f16 =
   map (\tok ->
     let t = if tok >= 0 && tok < vocab_size then tok else 0
